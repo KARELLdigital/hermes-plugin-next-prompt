@@ -3,43 +3,54 @@
 After each completed turn the plugin asks the host LLM for one short
 follow-up the user might send next and keeps it per session until the user
 uses it, dismisses it, or sends their own next message (``pre_llm_call``).
-Suggestions are saved under the profile's plugin-data dir, so switching
-screens or restarting the backend does not lose them. The desktop half reads
-them through ``dashboard/plugin_api.py``.
+Suggestions live in ``store.py``'s SQLite file under the profile's
+plugin-data dir: the desktop half reads them through
+``dashboard/plugin_api.py``, which may run in another process, and they
+survive screen switches and backend restarts.
 """
 
 import contextvars
+import hashlib
+import importlib.util
 import json
 import logging
-import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-_TTL_SECONDS = 7 * 24 * 3600
-_MAX_STORED = 200
 _UI_PLATFORMS = frozenset({"", "desktop", "tui"})
 _AUX_TASK = "next_prompt"
 
 # ── state ────────────────────────────────────────────────────────────────
 
-# session_id → {"text", "session_id", "timestamp"}. Read by plugin_api.py.
-_suggestions: Dict[str, Dict[str, Any]] = {}
-_suggestions_lock = threading.Lock()
-# session_id → {"kind", "session_id", "timestamp"} for the last turn whose
-# suggestion could not be generated. Memory only (a restart may be the fix);
-# guarded by _suggestions_lock. Read by plugin_api.py.
-_errors: Dict[str, Dict[str, Any]] = {}
+def _load_store():
+    """``store.py``, loaded by path like ``plugin_api.py`` does, so both halves
+    of one install share a single module object."""
+    path = Path(__file__).resolve().with_name("store.py")
+    name = "next_prompt_store_" + hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+    return module
+
+
+store = _load_store()
+
 # session_id → turn counter, bumped when the user sends a message. A
 # generator launched for an older turn must not publish over a newer one.
+# Per process is enough: a session's pre and post hooks run in the same one.
 _turn_seq: Dict[str, int] = {}
 _last_suggestion_time: Dict[str, float] = {}
-_store_path: Optional[Path] = None
-_llm_task: Optional[str] = None
+_lock = threading.Lock()
+_llm_task = None
 _ctx = None
 
 
@@ -54,69 +65,33 @@ def _get_settings() -> Dict[str, Any]:
 
 # ── persistence ──────────────────────────────────────────────────────────
 
-def _resolve_store_path(ctx) -> Optional[Path]:
-    """Called from register(), which runs inside the owning profile's home scope."""
+def _import_legacy_store(ctx) -> None:
+    """0.3.0 kept suggestions in ``suggestions.json`` under ``ctx.state.data_dir``,
+    a path the REST half cannot derive. Move what is still pending into the
+    store once, then set the file aside so a dismissed one never comes back."""
     try:
-        base = Path(ctx.state.data_dir)
-    except Exception:  # older hosts without ctx.state
-        try:
-            from hermes_constants import get_hermes_home
-            base = get_hermes_home() / "plugin-data" / "next-prompt"
-        except Exception:
-            return None
-    return base / "suggestions.json"
-
-
-def _live(entries: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    now = time.time()
-    kept = [
-        (sid, s) for sid, s in entries.items()
-        if isinstance(s, dict) and s.get("text") and now - float(s.get("timestamp") or 0) < _TTL_SECONDS
-    ]
-    kept.sort(key=lambda kv: kv[1].get("timestamp", 0), reverse=True)
-    return dict(kept[:_MAX_STORED])
-
-
-def _read_store() -> Dict[str, Any]:
-    if _store_path is None:
-        return {}
-    try:
-        data = json.loads(_store_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError) as exc:
-        logger.warning("next-prompt: ignoring unreadable %s: %s", _store_path, exc)
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _persist(session_id: str, suggestion: Optional[Dict[str, Any]]) -> None:
-    """Merge one change into the file (another process serving the same
-    profile may write it too). Caller holds ``_suggestions_lock``."""
-    if _store_path is None:
+        legacy = Path(ctx.state.data_dir) / "suggestions.json"
+    except Exception:
         return
-    data = _read_store()
-    if suggestion is None:
-        if session_id not in data:
-            return
-        data.pop(session_id)
-    else:
-        data[session_id] = suggestion
+    if not legacy.is_file():
+        return
     try:
-        _store_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _store_path.with_name(f"{_store_path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(_live(data), ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, _store_path)
+        entries = json.loads(legacy.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("next-prompt: ignoring unreadable %s: %s", legacy, exc)
+        entries = {}
+    imported = store.import_legacy(entries) if isinstance(entries, dict) else 0
+    try:
+        legacy.replace(legacy.with_name("suggestions.json.migrated"))
     except OSError as exc:
-        logger.warning("next-prompt: could not save %s: %s", _store_path, exc)
+        logger.warning("next-prompt: could not set %s aside: %s", legacy, exc)
+        return
+    logger.info("next-prompt: moved %d saved suggestion(s) to %s", imported, store.DB_FILE)
 
 
 def clear_suggestion(session_id: str) -> None:
     """Drop a session's suggestion and failure note (used, dismissed, or superseded)."""
-    with _suggestions_lock:
-        _suggestions.pop(session_id, None)
-        _errors.pop(session_id, None)
-        _persist(session_id, None)
+    store.clear(session_id)
 
 
 def _classify_error(exc: BaseException) -> str:
@@ -130,14 +105,6 @@ def _classify_error(exc: BaseException) -> str:
     if "timeout" in name:
         return "timeout"
     return "other"
-
-
-def _record_error(session_id: str, kind: str) -> None:
-    """Caller holds ``_suggestions_lock``."""
-    _errors[session_id] = {"kind": kind, "session_id": session_id, "timestamp": time.time()}
-    if len(_errors) > _MAX_STORED:
-        oldest = min(_errors, key=lambda sid: _errors[sid]["timestamp"])
-        _errors.pop(oldest, None)
 
 
 # ── suggestion generation ────────────────────────────────────────────────
@@ -320,23 +287,23 @@ def _generate_suggestion(session_id: str, seq: int, messages: list, settings: di
         text = _clean(getattr(result, "text", ""))
     except Exception as exc:
         logger.warning("next-prompt: suggestion generation failed for %s", session_id, exc_info=True)
-        with _suggestions_lock:
+        with _lock:
             if _turn_seq.get(session_id, 0) == seq:
-                _record_error(session_id, _classify_error(exc))
+                store.put_failure(session_id, _classify_error(exc))
         return
 
-    with _suggestions_lock:
+    # Under the lock, so the user's next message (pre_llm_call) cannot slip
+    # between the staleness check and the write.
+    with _lock:
         if _turn_seq.get(session_id, 0) != seq:
             return  # the user already moved on; this suggestion is stale
-        _errors.pop(session_id, None)
         if not text:
-            _suggestions.pop(session_id, None)
-            _persist(session_id, None)
+            store.clear(session_id)
             return
-        suggestion = {"text": text, "session_id": session_id, "timestamp": time.time()}
-        _suggestions[session_id] = suggestion
+        suggestion = store.put_suggestion(session_id, text)
+        if suggestion is None:
+            return
         _last_suggestion_time[session_id] = suggestion["timestamp"]
-        _persist(session_id, suggestion)
     logger.info("next-prompt: stored suggestion for session %s", session_id)
 
 
@@ -347,9 +314,9 @@ def _on_pre_llm_call(**kwargs) -> None:
     session_id = kwargs.get("session_id") or ""
     if not session_id:
         return
-    with _suggestions_lock:
+    with _lock:
         _turn_seq[session_id] = _turn_seq.get(session_id, 0) + 1
-    clear_suggestion(session_id)
+        store.clear(session_id)
 
 
 def _on_post_llm_call(**kwargs) -> None:
@@ -367,7 +334,7 @@ def _on_post_llm_call(**kwargs) -> None:
         return
     if time.time() - _last_suggestion_time.get(session_id, 0) < settings["cooldown_seconds"]:
         return
-    with _suggestions_lock:
+    with _lock:
         seq = _turn_seq.get(session_id, 0)
     # The worker must inherit this profile's secret/home scope, or ctx.llm
     # fails with UnscopedSecretError.
@@ -387,11 +354,9 @@ def _spawn(target, *args) -> None:
 # ── registration ─────────────────────────────────────────────────────────
 
 def register(ctx):
-    global _ctx, _store_path, _llm_task
+    global _ctx, _llm_task
     _ctx = ctx
-    _store_path = _resolve_store_path(ctx)
-    with _suggestions_lock:
-        _suggestions.update(_live(_read_store()))
+    _import_legacy_store(ctx)  # register() runs in the owning profile's home scope
     # Own auxiliary slot: runs on the main model by default, but the user can
     # point `auxiliary.next_prompt` at a cheaper/faster model.
     try:
@@ -405,4 +370,4 @@ def register(ctx):
         _llm_task = None  # older host: plain main-model call
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
-    logger.info("next-prompt: registered (%d saved suggestion(s))", len(_suggestions))
+    logger.info("next-prompt: registered (%d saved suggestion(s) in %s)", store.count(), store.DB_FILE)

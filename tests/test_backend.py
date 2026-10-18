@@ -1,4 +1,4 @@
-"""Behaviour of the Python half (__init__.py + dashboard/plugin_api.py).
+"""Behaviour of the Python half (__init__.py, store.py, dashboard/plugin_api.py).
 
 Run: python -m unittest discover -s tests -v
 Needs the hermes-agent package importable (its venv, or `pip install -e`).
@@ -9,9 +9,13 @@ from __future__ import annotations
 import importlib.util
 import itertools
 import json
+import os
 import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import types
@@ -81,14 +85,32 @@ def wait_for(predicate, timeout=5.0):
 
 
 class PluginTestCase(unittest.TestCase):
+    """Each test gets its own Hermes home (the store lives under it) and its
+    own ``ctx.state.data_dir`` (where 0.3.0 kept ``suggestions.json``)."""
+
     def setUp(self):
-        self.data_dir = Path(tempfile.mkdtemp(prefix="next-prompt-test-"))
+        self.home = Path(tempfile.mkdtemp(prefix="next-prompt-home-"))
+        self.data_dir = Path(tempfile.mkdtemp(prefix="next-prompt-state-"))
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.data_dir, ignore_errors=True)
+        previous = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(self.home)
+        self.addCleanup(self._restore_home, previous)
         self.modules = []
         self.addCleanup(self._unload)
+        module = load_plugin()
+        self.modules.append(module)
+        self.store = module.store  # the module object every load of this tree shares
+
+    @staticmethod
+    def _restore_home(previous):
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
 
     def _unload(self):
-        # Let workers finish before the temp dir goes away.
+        # Let workers finish before the temp dirs go away.
         for thread in threading.enumerate():
             if thread.name.startswith("next-prompt") and thread is not threading.current_thread():
                 thread.join(timeout=5)
@@ -102,14 +124,17 @@ class PluginTestCase(unittest.TestCase):
         module.register(ctx)
         return module, ctx
 
-    def stored(self):
-        path = self.data_dir / "suggestions.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    def db_path(self):
+        return self.home / "plugin-data" / "next-prompt" / "suggestions.db"
 
-    @staticmethod
-    def has(module, session_id):
-        with module._suggestions_lock:
-            return session_id in module._suggestions
+    def suggestion(self, session_id):
+        return self.store.get(session_id)["suggestion"]
+
+    def has(self, session_id):
+        return self.suggestion(session_id) is not None
+
+    def failed(self, session_id):
+        return dict(self.store.get(session_id)["error"] or {})
 
     @staticmethod
     def turn_done(ctx, session_id, platform="desktop", history=HISTORY, **extra):
@@ -125,8 +150,9 @@ class GenerationTests(PluginTestCase):
     def test_generates_and_persists(self):
         module, ctx = self.start()
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.has(module, "s1")))
-        self.assertEqual(self.stored()["s1"]["text"], "Haz el deploy a producción")
+        self.assertTrue(wait_for(lambda: self.has("s1")))
+        self.assertEqual(self.suggestion("s1")["text"], "Haz el deploy a producción")
+        self.assertTrue(self.db_path().is_file())
 
     def test_calls_the_llm_on_its_own_aux_task(self):
         llm = FakeLLM()
@@ -148,17 +174,17 @@ class GenerationTests(PluginTestCase):
     def test_survives_a_backend_restart(self):
         module, ctx = self.start()
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.has(module, "s1")))
+        self.assertTrue(wait_for(lambda: self.has("s1")))
+        self._unload()
         restarted, _ = self.start(FakeLLM(text="otra"))
-        self.assertEqual(restarted._suggestions["s1"]["text"], "Haz el deploy a producción")
+        self.assertEqual(restarted.store.get("s1")["suggestion"]["text"], "Haz el deploy a producción")
 
-    def test_own_message_clears_memory_and_disk(self):
+    def test_own_message_clears_it(self):
         module, ctx = self.start()
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.has(module, "s1")))
+        self.assertTrue(wait_for(lambda: self.has("s1")))
         ctx.hooks["pre_llm_call"](session_id="s1", platform="desktop", user_message="otra cosa")
-        self.assertFalse(self.has(module, "s1"))
-        self.assertNotIn("s1", self.stored())
+        self.assertFalse(self.has("s1"))
 
     def test_late_answer_for_an_old_turn_is_discarded(self):
         llm = FakeLLM(delay=0.4)
@@ -168,7 +194,7 @@ class GenerationTests(PluginTestCase):
         ctx.hooks["pre_llm_call"](session_id="s2", platform="desktop")
         self.assertTrue(wait_for(lambda: llm.calls))
         time.sleep(0.6)
-        self.assertFalse(self.has(module, "s2"))
+        self.assertFalse(self.has("s2"))
 
     def test_messaging_platforms_never_spend_a_call(self):
         llm = FakeLLM()
@@ -187,10 +213,9 @@ class GenerationTests(PluginTestCase):
 
     def test_null_answer_shows_nothing_and_clears_the_old_one(self):
         module, ctx = self.start(FakeLLM(text="NULL"))
-        with module._suggestions_lock:
-            module._suggestions["s3"] = {"text": "x", "session_id": "s3", "timestamp": time.time()}
+        self.store.put_suggestion("s3", "x")
         self.turn_done(ctx, "s3")
-        self.assertTrue(wait_for(lambda: not self.has(module, "s3")))
+        self.assertTrue(wait_for(lambda: not self.has("s3")))
 
     def test_hooks_tolerate_unknown_kwargs(self):
         module, ctx = self.start()
@@ -198,9 +223,43 @@ class GenerationTests(PluginTestCase):
         ctx.hooks["pre_llm_call"](session_id="s9", another_future_field=True)
 
     def test_suggestions_expire_after_a_week(self):
-        module, _ = self.start()
-        old = {"text": "viejo", "session_id": "old", "timestamp": time.time() - 8 * 24 * 3600}
-        self.assertNotIn("old", module._live({"old": old}))
+        self.start()
+        self.store.put_suggestion("old", "viejo")
+        with sqlite3.connect(self.db_path()) as conn:
+            conn.execute("UPDATE pending SET timestamp = ? WHERE session_id = 'old'", (time.time() - 8 * 24 * 3600,))
+        self.assertFalse(self.has("old"))
+
+
+class LegacyStoreTests(PluginTestCase):
+    """0.3.0 kept pending suggestions in ``ctx.state.data_dir/suggestions.json``."""
+
+    def write_legacy(self, entries):
+        (self.data_dir / "suggestions.json").write_text(json.dumps(entries), encoding="utf-8")
+
+    def test_pending_suggestions_move_to_the_store_once(self):
+        now = time.time()
+        self.write_legacy({
+            "s1": {"text": "Sigue con el deploy", "session_id": "s1", "timestamp": now},
+            "old": {"text": "viejo", "session_id": "old", "timestamp": now - 8 * 24 * 3600},
+        })
+        self.start()
+        self.assertEqual(self.suggestion("s1")["text"], "Sigue con el deploy")
+        self.assertFalse(self.has("old"))
+        self.assertFalse((self.data_dir / "suggestions.json").exists())
+        self.assertTrue((self.data_dir / "suggestions.json.migrated").exists())
+
+    def test_a_dismissed_suggestion_does_not_come_back_after_a_restart(self):
+        self.write_legacy({"s1": {"text": "x", "session_id": "s1", "timestamp": time.time()}})
+        self.start()
+        self.store.clear("s1")
+        self._unload()
+        self.start()
+        self.assertFalse(self.has("s1"))
+
+    def test_unreadable_legacy_file_is_set_aside(self):
+        (self.data_dir / "suggestions.json").write_text("{not json", encoding="utf-8")
+        self.start()
+        self.assertTrue((self.data_dir / "suggestions.json.migrated").exists())
 
 
 class ContextAndCleanTests(unittest.TestCase):
@@ -318,10 +377,6 @@ class ReadTimeout(Exception):
 
 
 class FailureTests(PluginTestCase):
-    def failed(self, module, session_id):
-        with module._suggestions_lock:
-            return dict(module._errors.get(session_id) or {})
-
     def test_failure_kinds(self):
         cases = [
             (AuthError("revoked"), "auth"),
@@ -331,40 +386,43 @@ class FailureTests(PluginTestCase):
         ]
         for error, kind in cases:
             with self.subTest(kind=kind):
+                session_id = f"s-{kind}"
                 module, ctx = self.start(FakeLLM(error=error))
-                self.turn_done(ctx, "s1")
-                self.assertTrue(wait_for(lambda: self.failed(module, "s1")))
-                self.assertEqual(self.failed(module, "s1")["kind"], kind)
+                self.turn_done(ctx, session_id)
+                self.assertTrue(wait_for(lambda: self.failed(session_id)))
+                self.assertEqual(self.failed(session_id)["kind"], kind)
 
     def test_failure_detail_never_leaks(self):
-        module, ctx = self.start(FakeLLM(error=AuthError("sk-secret-token-in-message")))
+        module, ctx = self.start(FakeLLM(error=AuthError("sk-secret-value")))
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.failed(module, "s1")))
-        self.assertNotIn("sk-secret", json.dumps(self.failed(module, "s1")))
+        self.assertTrue(wait_for(lambda: self.failed("s1")))
+        self.assertNotIn("sk-secret", json.dumps(self.failed("s1")))
+        self.assertNotIn(b"sk-secret", self.db_path().read_bytes())
 
-    def test_failure_is_not_written_to_disk(self):
-        module, ctx = self.start(FakeLLM(error=AuthError("x")))
-        self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.failed(module, "s1")))
-        self.assertNotIn("s1", self.stored())
+    def test_failure_note_expires_sooner_than_a_suggestion(self):
+        self.start()
+        self.store.put_failure("s1", "auth")
+        with sqlite3.connect(self.db_path()) as conn:
+            conn.execute("UPDATE pending SET timestamp = ? WHERE session_id = 's1'", (time.time() - 7 * 3600,))
+        self.assertEqual(self.failed("s1"), {})
 
     def test_success_clears_the_failure(self):
         llm = FakeLLM(error=AuthError("x"))
         module, ctx = self.start(llm)
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.failed(module, "s1")))
+        self.assertTrue(wait_for(lambda: self.failed("s1")))
         llm.error = None
         module._last_suggestion_time.clear()
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.has(module, "s1")))
-        self.assertEqual(self.failed(module, "s1"), {})
+        self.assertTrue(wait_for(lambda: self.has("s1")))
+        self.assertEqual(self.failed("s1"), {})
 
     def test_own_message_clears_the_failure(self):
         module, ctx = self.start(FakeLLM(error=AuthError("x")))
         self.turn_done(ctx, "s1")
-        self.assertTrue(wait_for(lambda: self.failed(module, "s1")))
+        self.assertTrue(wait_for(lambda: self.failed("s1")))
         ctx.hooks["pre_llm_call"](session_id="s1")
-        self.assertEqual(self.failed(module, "s1"), {})
+        self.assertEqual(self.failed("s1"), {})
 
     def test_failure_for_an_old_turn_is_discarded(self):
         llm = FakeLLM(error=AuthError("x"), delay=0.4)
@@ -374,7 +432,7 @@ class FailureTests(PluginTestCase):
         ctx.hooks["pre_llm_call"](session_id="s2")
         self.assertTrue(wait_for(lambda: llm.calls))
         time.sleep(0.6)
-        self.assertEqual(self.failed(module, "s2"), {})
+        self.assertEqual(self.failed("s2"), {})
 
 
 class RestApiTests(PluginTestCase):
@@ -393,11 +451,11 @@ class RestApiTests(PluginTestCase):
     def test_get_and_dismiss(self):
         module, ctx = self.start(FakeLLM(text="Revisa los logs"))
         self.turn_done(ctx, "s4")
-        self.assertTrue(wait_for(lambda: self.has(module, "s4")))
+        self.assertTrue(wait_for(lambda: self.has("s4")))
         self.assertEqual(self.get("s4")["suggestion"]["text"], "Revisa los logs")
         self.client.post("/api/plugins/next-prompt/dismiss", params={"session_id": "s4"})
         self.assertEqual(self.get("s4"), {"suggestion": None, "error": None})
-        self.assertNotIn("s4", self.stored())
+        self.assertFalse(self.has("s4"))
 
     def test_failure_is_reported_and_dismissable(self):
         module, ctx = self.start(FakeLLM(error=AuthError("x")))
@@ -409,25 +467,35 @@ class RestApiTests(PluginTestCase):
         self.client.post("/api/plugins/next-prompt/dismiss", params={"session_id": "s5"})
         self.assertEqual(self.get("s5"), {"suggestion": None, "error": None})
 
-    def test_newer_suggestion_hides_an_older_failure(self):
-        module, _ = self.start()
-        with module._suggestions_lock:
-            module._errors["s6"] = {"kind": "auth", "session_id": "s6", "timestamp": 1.0}
-            module._suggestions["s6"] = {"text": "ok", "session_id": "s6", "timestamp": 2.0}
+    def test_newer_suggestion_replaces_an_older_failure(self):
+        self.start()
+        self.store.put_failure("s6", "auth")
+        self.store.put_suggestion("s6", "ok")
         body = self.get("s6")
         self.assertEqual(body["suggestion"]["text"], "ok")
         self.assertIsNone(body["error"])
 
-    def test_newest_wins_across_profile_instances(self):
-        first, _ = self.start()
-        second, _ = self.start()
-        with first._suggestions_lock:
-            first._suggestions["s1"] = {"text": "old", "session_id": "s1", "timestamp": 1.0}
-        with second._suggestions_lock:
-            second._suggestions["s1"] = {"text": "new", "session_id": "s1", "timestamp": 2.0}
-        self.assertEqual(self.get("s1")["suggestion"]["text"], "new")
+    def test_missing_or_blank_session(self):
         self.assertEqual(self.get("missing"), {"suggestion": None, "error": None})
         self.assertEqual(self.get(""), {"suggestion": None, "error": None})
+
+    def test_reads_a_suggestion_written_by_another_process(self):
+        """The bug behind 0.3.1: on a gateway serving several profiles, a
+        secondary profile's plugin API runs in its plugin host while its hooks
+        run in the gateway. Write from a separate interpreter, read here."""
+        script = textwrap.dedent(f"""
+            import importlib.util, sys
+            spec = importlib.util.spec_from_file_location("np_store_child", {str(ROOT / "store.py")!r})
+            store = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(store)
+            assert store.put_suggestion("s-cross", "Desde otro proceso") is not None
+        """)
+        # Same import path as this interpreter (hermes-agent, its dependencies).
+        env = dict(os.environ, HERMES_HOME=str(self.home), PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+        subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=60)
+        self.assertEqual(self.get("s-cross")["suggestion"]["text"], "Desde otro proceso")
+        self.client.post("/api/plugins/next-prompt/dismiss", params={"session_id": "s-cross"})
+        self.assertFalse(self.has("s-cross"))
 
 
 if __name__ == "__main__":

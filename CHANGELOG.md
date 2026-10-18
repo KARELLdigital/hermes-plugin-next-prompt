@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1
+
+- **Fix: no suggestions on a gateway that serves several profiles.** Since
+  hermes-agent runs a secondary profile's dashboard plugin API in that
+  profile's plugin host (NousResearch/hermes-agent#139689), the REST route
+  and the hooks of a non-launch profile live in different processes. 0.3.0
+  handed suggestions over in memory, so Desktop connected to such a gateway
+  (e.g. a remote dashboard started with `-p default` while you chat in
+  another profile) always got `null`. Suggestions and failure notes now live
+  in a SQLite file under the profile's `plugin-data/next-prompt/` (via
+  `plugin_db`, WAL), which both processes read and write.
+- Pending suggestions from 0.3.0's `suggestions.json` move over on first load;
+  the old file is renamed `suggestions.json.migrated`.
+- Failure notes now cross processes too, and expire after 6 hours.
+
 ## 0.3.0
 
 - **Keyboard and palette.** Ctrl/⌘+Shift+Y uses the suggestion shown in the

@@ -3,59 +3,51 @@
 Mounted by the backend at ``/api/plugins/next-prompt/``. The desktop half
 reaches it through ``ctx.rest`` (profile-routed, authenticated).
 
-The hook side (``__init__.py``) may be imported more than once in one
-process — once per served profile home (``hermes_plugins.next_prompt`` and
-``hermes_plugins.next_prompt__home_<hash>``). Each instance keeps its own
-``_suggestions`` dict, so the endpoints look across all of them.
+This router and the hooks in ``__init__.py`` can live in different
+processes: a gateway serving several profiles runs a secondary profile's
+plugin API in that profile's plugin host, while the profile's turns (and
+their hooks) run in the gateway. So the endpoints read and write
+``store.py``'s SQLite file, never the hook module's memory. The host imports
+this file by path with no package, so ``store.py`` is loaded by path too.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import sys
+from pathlib import Path
 
 from fastapi import APIRouter, Query
 
 router = APIRouter()
 
 
-def _instances():
-    for name, mod in list(sys.modules.items()):
-        if mod is None or ("next_prompt" not in name and "next-prompt" not in name):
-            continue
-        if hasattr(mod, "_suggestions") and hasattr(mod, "_suggestions_lock"):
-            yield mod
+def _store():
+    path = Path(__file__).resolve().parents[1] / "store.py"
+    name = "next_prompt_store_" + hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+    return module
+
+
+# Plain ``def`` handlers: SQLite is blocking I/O, so FastAPI runs them in a
+# worker thread instead of on the event loop.
 
 
 @router.get("/suggestion")
-async def get_suggestion(session_id: str = Query("")):
-    """The session's pending suggestion, or — when the last attempt failed and
-    nothing newer exists — the failure kind so the UI can say why."""
-    if not session_id:
-        return {"suggestion": None, "error": None}
-    best = None
-    failure = None
-    for mod in _instances():
-        with mod._suggestions_lock:
-            found = mod._suggestions.get(session_id)
-            failed = getattr(mod, "_errors", {}).get(session_id)
-        if found and (best is None or found.get("timestamp", 0) > best.get("timestamp", 0)):
-            best = dict(found)
-        if failed and (failure is None or failed.get("timestamp", 0) > failure.get("timestamp", 0)):
-            failure = dict(failed)
-    if best and failure and best.get("timestamp", 0) >= failure.get("timestamp", 0):
-        failure = None
-    return {"suggestion": best, "error": failure}
+def get_suggestion(session_id: str = Query("")):
+    """The session's pending suggestion, or, when the last attempt failed,
+    the failure kind so the UI can say why."""
+    return _store().get(session_id)
 
 
 @router.post("/dismiss")
-async def dismiss_suggestion(session_id: str = Query("")):
+def dismiss_suggestion(session_id: str = Query("")):
     if session_id:
-        for mod in _instances():
-            clear = getattr(mod, "clear_suggestion", None)
-            if callable(clear):
-                clear(session_id)
-            else:
-                with mod._suggestions_lock:
-                    mod._suggestions.pop(session_id, None)
-                    getattr(mod, "_errors", {}).pop(session_id, None)
+        _store().clear(session_id)
     return {"ok": True}

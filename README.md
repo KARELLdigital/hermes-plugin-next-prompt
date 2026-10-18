@@ -119,9 +119,13 @@ plugins:
    background worker asks `ctx.llm` for the message you are most likely to
    send next: your answer when the agent asked you something, otherwise a
    next step. `NULL` only when the exchange is closed (thanks, goodbye).
-2. **Per-chat storage.** The suggestion is kept in the plugin's data directory
-   (`ctx.state.data_dir`, under the profile's `plugin-data/`) until you use
-   it, dismiss it, or send your own message (`pre_llm_call`).
+2. **Per-chat storage.** The suggestion is kept in a small SQLite file in
+   the plugin's data directory (`plugin-data/next-prompt/suggestions.db` in
+   the profile) until you use it, dismiss it, or send your own message
+   (`pre_llm_call`). The hook and the REST route may run in different
+   processes (a gateway serving several profiles runs a secondary profile's
+   plugin API in that profile's plugin host), so this file is the only state
+   they share.
 3. **Desktop half.** Reads the suggestion through the plugin's REST route
    (`ctx.rest` → `/api/plugins/next-prompt/suggestion`) and renders it in the
    `composer.underside` area.
